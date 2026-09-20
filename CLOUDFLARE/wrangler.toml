@@ -1,0 +1,28 @@
+name = "eagler-minecraft-relay"
+main = "./cloudflare/worker.js"
+compatibility_date = "2026-07-24"
+
+[vars]
+RELAY_PUBLIC = "1"
+RELAY_ALLOWED_ORIGINS = ""
+RELAY_MAX_BYTES_PER_MINUTE = "67108864"
+RELAY_MAX_LIFETIME_MS = "0"
+RELAY_MAX_LAN_PEERS = "8"
+RELAY_ICE_SERVERS = "stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302"
+RELAY_DNS_HTTPS = "https://cloudflare-dns.com/dns-query"
+
+[[durable_objects.bindings]]
+name = "LAN_ROOMS"
+class_name = "LanRoom"
+
+[[durable_objects.bindings]]
+name = "MINECRAFT_TUNNELS"
+class_name = "MinecraftTunnel"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LanRoom"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["MinecraftTunnel"]

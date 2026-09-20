@@ -1,5 +1,5 @@
 name = "eagler-minecraft-relay"
-main = "./cloudflare/worker.js"
+main = "./CLOUDFLARE/worker.js"
 compatibility_date = "2026-07-24"
 
 [vars]

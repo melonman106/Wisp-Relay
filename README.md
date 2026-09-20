@@ -1,4 +1,4 @@
-# Eaglercraft 26.2 Relay
+# Eaglercraft 26.2 Web Socket Relay
 
 A small WebSocket relay for Eaglercraft 26.2. It supports Minecraft Java connections and Eaglercraft 1.8 LAN signaling.
 

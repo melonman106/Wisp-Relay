@@ -281,7 +281,7 @@ async function handlePartyRequest(request, env, url) {
 
   const allowedOrigins = String(env.RELAY_ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
   const origin = request.headers.get("origin") ?? "";
-  if (allowedOrigins.length && origin && !allowedOrigins.includes(origin)) {
+  if (allowedOrigins.length && !allowedOrigins.includes("*") && origin && !allowedOrigins.includes(origin)) {
     return partyResponse(request, { ok: false, error: "origin is not allowed" }, 403);
   }
 

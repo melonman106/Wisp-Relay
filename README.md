@@ -136,3 +136,33 @@ npx wrangler deploy --dry-run --config cloudflare/wrangler.toml
 ## License
 
 MIT.
+
+
+## VBV party service (Cloudflare D1)
+
+The same Worker can expose a small HTTP API for the Eaglercraft VBV party system. It supports party creation, joining by six-character code, host-only kicking/disbanding, member leave, and a five-second client heartbeat.
+
+### Configure the D1 database
+
+1. In Cloudflare, open **Storage & databases → D1 SQL Database** and create a database (for example, `vbv-parties`).
+2. Open its **Console** and run the SQL from [cloudflare/schema/0001_vbv_parties.sql](cloudflare/schema/0001_vbv_parties.sql).
+3. Open **Workers & Pages → eagler-minecraft-relay → Settings → Bindings**.
+4. Add a **D1 database** binding with variable name **`VBV_PARTIES`** and select the database you created.
+5. Deploy the updated Worker code.
+
+The dashboard binding is required because each Cloudflare account has its own D1 database ID. If deploying with Wrangler instead, add a D1 binding named `VBV_PARTIES` to `cloudflare/wrangler.toml` using your own database ID.
+
+### API
+
+All requests are JSON `POST` requests under `/party/`:
+
+- `create`: `{ "name": "Player" }` → returns a party code and private member token.
+- `join`: `{ "code": "ABC123", "name": "Player" }` → joins an existing party.
+- `poll`: `{ "code": "ABC123", "token": "..." }` → refreshes the member heartbeat and returns the current roster.
+- `kick`: `{ "code": "ABC123", "token": "...", "memberId": "..." }` → host-only removal.
+- `leave`: `{ "code": "ABC123", "token": "..." }` → leaves; if the host leaves, the party is disbanded.
+- `disband`: `{ "code": "ABC123", "token": "..." }` → host-only disband.
+
+The client token is stored locally and only its SHA-256 hash is stored in D1. The client polls every five seconds. Guest members that stop polling are removed after 30 seconds; if the host stops polling, the whole party is deleted after 30 seconds. Parties also have a six-hour inactivity expiry. The party limit is eight members.
+
+The API returns `503` with a setup message until the `VBV_PARTIES` binding is configured.

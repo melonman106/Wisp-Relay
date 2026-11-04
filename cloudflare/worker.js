@@ -168,10 +168,231 @@ function openMinecraftUpstream(request, env) {
   return fetch(new Request(upstream, request));
 }
 
+
+const PARTY_NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
+const PARTY_CODE_RE = /^[A-Z0-9]{6}$/;
+const PARTY_STALE_MS = 30000;
+const PARTY_MAX_MEMBERS = 8;
+
+function partyResponse(request, data, status = 200) {
+  const origin = request.headers.get("origin") || "*";
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "access-control-allow-origin": origin,
+      "access-control-allow-methods": "POST, OPTIONS",
+      "access-control-allow-headers": "content-type, authorization",
+      "vary": "Origin"
+    }
+  });
+}
+
+async function partyBody(request) {
+  const raw = await request.text();
+  if (raw.length > 8192) throw new Error("party request is too large");
+  try { return JSON.parse(raw || "{}"); }
+  catch { throw new Error("invalid JSON request"); }
+}
+
+function partyToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
+}
+
+async function partyTokenHash(token) {
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(String(token)));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function partyName(value) {
+  const name = String(value ?? "").trim();
+  if (!PARTY_NAME_RE.test(name)) throw new Error("player name must be 1-16 letters, numbers or underscores");
+  return name;
+}
+
+function partyCode(value) {
+  const code = String(value ?? "").trim().toUpperCase();
+  if (!PARTY_CODE_RE.test(code)) throw new Error("party code must contain six letters or numbers");
+  return code;
+}
+
+async function partyDelete(db, code) {
+  await db.prepare("DELETE FROM vbv_party_members WHERE party_code = ?").bind(code).run();
+  await db.prepare("DELETE FROM vbv_parties WHERE code = ?").bind(code).run();
+}
+
+async function partyCleanup(db, code, now) {
+  const party = await db.prepare(
+    "SELECT code, host_member_id, expires_at FROM vbv_parties WHERE code = ?"
+  ).bind(code).first();
+  if (!party) return null;
+  const host = await db.prepare(
+    "SELECT last_seen FROM vbv_party_members WHERE id = ? AND party_code = ?"
+  ).bind(party.host_member_id, code).first();
+  if (!host || Number(host.last_seen) < now - PARTY_STALE_MS || Number(party.expires_at) < now) {
+    await partyDelete(db, code);
+    return null;
+  }
+  await db.prepare(
+    "DELETE FROM vbv_party_members WHERE party_code = ? AND id != ? AND last_seen < ?"
+  ).bind(code, party.host_member_id, now - PARTY_STALE_MS).run();
+  return party;
+}
+
+async function partyAuthenticate(db, code, token) {
+  if (!token || String(token).length > 256) return null;
+  const hash = await partyTokenHash(token);
+  return await db.prepare(
+    "SELECT m.id, m.player_name, p.host_member_id FROM vbv_party_members m " +
+    "JOIN vbv_parties p ON p.code = m.party_code " +
+    "WHERE m.party_code = ? AND m.token_hash = ?"
+  ).bind(code, hash).first();
+}
+
+async function partySnapshot(db, code, member) {
+  const rows = await db.prepare(
+    "SELECT id, player_name FROM vbv_party_members WHERE party_code = ? ORDER BY joined_at ASC"
+  ).bind(code).all();
+  return {
+    ok: true,
+    code,
+    host: member.id === member.host_member_id,
+    members: (rows.results || []).map((row) => ({
+      id: row.id,
+      name: row.player_name,
+      host: row.id === member.host_member_id
+    }))
+  };
+}
+
+async function handlePartyRequest(request, env, url) {
+  if (request.method === "OPTIONS") return partyResponse(request, { ok: true });
+  if (request.method !== "POST") return partyResponse(request, { ok: false, error: "POST required" }, 405);
+  if (!env.VBV_PARTIES) {
+    return partyResponse(request, {
+      ok: false,
+      error: "party database is not configured; bind the Cloudflare D1 database as VBV_PARTIES"
+    }, 503);
+  }
+
+  const allowedOrigins = String(env.RELAY_ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+  const origin = request.headers.get("origin") ?? "";
+  if (allowedOrigins.length && origin && !allowedOrigins.includes(origin)) {
+    return partyResponse(request, { ok: false, error: "origin is not allowed" }, 403);
+  }
+
+  const db = env.VBV_PARTIES;
+  const action = url.pathname.slice("/party/".length).replace(/\\/$/, "");
+  const now = Date.now();
+  try {
+    const body = await partyBody(request);
+
+    if (action === "create") {
+      const name = partyName(body.name);
+      let code = "";
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const candidate = randomLANCode();
+        const exists = await db.prepare("SELECT code FROM vbv_parties WHERE code = ?").bind(candidate).first();
+        if (!exists) { code = candidate; break; }
+      }
+      if (!code) return partyResponse(request, { ok: false, error: "could not allocate a party code; try again" }, 503);
+      const id = randomPeerId();
+      const token = partyToken();
+      const tokenHash = await partyTokenHash(token);
+      await db.prepare(
+        "INSERT INTO vbv_parties (code, host_member_id, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?)"
+      ).bind(code, id, now, now, now + 6 * 60 * 60 * 1000).run();
+      await db.prepare(
+        "INSERT INTO vbv_party_members (id, party_code, player_name, token_hash, joined_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)"
+      ).bind(id, code, name, tokenHash, now, now).run();
+      return partyResponse(request, { ok: true, code, token, memberId: id, host: true, members: [{ id, name, host: true }] });
+    }
+
+    if (action === "join") {
+      const code = partyCode(body.code);
+      const name = partyName(body.name);
+      const party = await partyCleanup(db, code, now);
+      if (!party) return partyResponse(request, { ok: false, error: "party not found or its host has disconnected" }, 404);
+      const count = await db.prepare("SELECT COUNT(*) AS count FROM vbv_party_members WHERE party_code = ?").bind(code).first();
+      if (Number(count?.count || 0) >= PARTY_MAX_MEMBERS) {
+        return partyResponse(request, { ok: false, error: "party is full" }, 409);
+      }
+      const duplicate = await db.prepare(
+        "SELECT id FROM vbv_party_members WHERE party_code = ? AND lower(player_name) = lower(?)"
+      ).bind(code, name).first();
+      if (duplicate) return partyResponse(request, { ok: false, error: "that player is already in this party" }, 409);
+      const id = randomPeerId();
+      const token = partyToken();
+      const tokenHash = await partyTokenHash(token);
+      await db.prepare(
+        "INSERT INTO vbv_party_members (id, party_code, player_name, token_hash, joined_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)"
+      ).bind(id, code, name, tokenHash, now, now).run();
+      await db.prepare("UPDATE vbv_parties SET updated_at = ?, expires_at = ? WHERE code = ?")
+        .bind(now, now + 6 * 60 * 60 * 1000, code).run();
+      return partyResponse(request, { ok: true, code, token, memberId: id, host: false });
+    }
+
+    if (action === "poll" || action === "leave" || action === "kick" || action === "disband") {
+      const code = partyCode(body.code);
+      const party = await partyCleanup(db, code, now);
+      if (!party) return partyResponse(request, { ok: false, error: "party has ended" }, 404);
+      const member = await partyAuthenticate(db, code, body.token);
+      if (!member) return partyResponse(request, { ok: false, error: "party session is invalid; rejoin using the code" }, 401);
+
+      if (action === "poll") {
+        await db.prepare("UPDATE vbv_party_members SET last_seen = ? WHERE id = ?").bind(now, member.id).run();
+        await db.prepare("UPDATE vbv_parties SET updated_at = ?, expires_at = ? WHERE code = ?")
+          .bind(now, now + 6 * 60 * 60 * 1000, code).run();
+        return partyResponse(request, await partySnapshot(db, code, member));
+      }
+
+      if (action === "leave") {
+        if (member.id === member.host_member_id) {
+          await partyDelete(db, code);
+          return partyResponse(request, { ok: true, ended: true });
+        }
+        await db.prepare("DELETE FROM vbv_party_members WHERE id = ?").bind(member.id).run();
+        const count = await db.prepare("SELECT COUNT(*) AS count FROM vbv_party_members WHERE party_code = ?").bind(code).first();
+        if (Number(count?.count || 0) === 0) await partyDelete(db, code);
+        return partyResponse(request, { ok: true, ended: false });
+      }
+
+      if (action === "disband") {
+        if (member.id !== member.host_member_id) return partyResponse(request, { ok: false, error: "only the party host can disband the party" }, 403);
+        await partyDelete(db, code);
+        return partyResponse(request, { ok: true, ended: true });
+      }
+
+      if (action === "kick") {
+        if (member.id !== member.host_member_id) return partyResponse(request, { ok: false, error: "only the party host can kick players" }, 403);
+        const targetId = String(body.memberId ?? "");
+        if (!targetId || targetId === member.host_member_id) return partyResponse(request, { ok: false, error: "invalid kick target" }, 400);
+        const target = await db.prepare(
+          "SELECT id FROM vbv_party_members WHERE id = ? AND party_code = ?"
+        ).bind(targetId, code).first();
+        if (!target) return partyResponse(request, { ok: false, error: "player is no longer in this party" }, 404);
+        await db.prepare("DELETE FROM vbv_party_members WHERE id = ?").bind(targetId).run();
+        return partyResponse(request, { ok: true });
+      }
+    }
+
+    return partyResponse(request, { ok: false, error: "unknown party action" }, 404);
+  } catch (error) {
+    return partyResponse(request, { ok: false, error: error instanceof Error ? error.message : "party request failed" }, 400);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const publicAccess = String(env.RELAY_PUBLIC ?? "") === "1";
+    if (url.pathname === "/party" || url.pathname.startsWith("/party/")) {
+      return handlePartyRequest(request, env, url);
+    }
     if (url.pathname === "/health") {
       return Response.json({
         ok: true,
